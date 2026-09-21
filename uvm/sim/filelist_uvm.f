@@ -6,6 +6,7 @@
 +incdir+uvm/seq
 +incdir+uvm/tests
 rtl/ace_pkg.sv
+rtl/link/ace_ucie_link_model.sv
 rtl/module_a.sv
 rtl/module_b.sv
 uvm/tb/ace_if.sv

@@ -110,15 +110,74 @@ UVM_ERROR:0 + UVM_FATAL:0 四重 grep）。日志 `passive_vip_mode<N>.log`。
 
 ## 4. UVM 用例介绍
 
-三个 test 共用同一测试基类，**区别只在启动哪条剧本（sequence）**：
+六个 test 共用同一测试基类，区别在于启动的 sequence、链路延迟模式和预期结果：
 
 | test（+UVM_TESTNAME）| 剧本 | 内容 | 定位 |
 |---|---|---|---|
 | `ace_smoke_test` | ace_write_read_seq | 每行三笔：写(WU)→读(RS)→独占读(RU)，4 行 12 笔 | 数据面地基回归（每次改 RTL 第一反应）；RU 确定性制造 UD 行 |
 | `ace_snoop_test` | ace_snoop_seq | 三轮读：RS 铺行 → RS 重读 → RU 重读 | 一致性闭环演练：第二轮触发 IsShared 共享闭环，第三轮触发脏行 CD 闭环 |
 | `ace_random_test` | ace_random_seq | 50 笔随机合法订单（读写≈3:7，属性/地址随机）| 随机交错压力 + 覆盖收敛（多轮多 seed）|
+| `ace_link_delay_test` | ace_write_read_seq | 由mask选择ACE通道，经单槽链路缓冲并固定延迟4拍 | 检查延迟后事务、snoop及CD闭环仍能完成 |
+| `ace_link_timeout_test` | ace_write_read_seq | mask目标通道延迟300拍，超过256拍超时阈值 | 负向测试：命中Module A/B预期timeout且无其他功能错误时判定PASS |
+| `ace_link_order_test` | ace_random_seq | 50笔随机订单，十通道同时延迟4拍 | 检查逐通道输入/输出数量、顺序及payload稳定性 |
 
-三个 test 都会伴随 home 自动出题质询；收尾等待 500 拍供 home 完成最后的质询
+单项运行：
+
+```bash
+bash uvm/sim/run_uvm_vcs.sh ace_smoke_test
+bash uvm/sim/run_uvm_vcs.sh ace_snoop_test
+bash uvm/sim/run_uvm_vcs.sh ace_random_test
+bash uvm/sim/run_uvm_vcs.sh ace_link_delay_test
+bash uvm/sim/run_uvm_vcs.sh ace_link_timeout_test
+bash uvm/sim/run_uvm_vcs.sh ace_link_order_test
+```
+
+第二个参数选择数据模式，取值为 `0..3`。例如运行四种 smoke 数据模式：
+
+```bash
+for mode in 0 1 2 3; do
+  bash uvm/sim/run_uvm_vcs.sh ace_smoke_test "$mode"
+done
+```
+
+链路逐通道矩阵：
+
+```bash
+bash uvm/sim/run_link_delay_matrix.sh
+bash uvm/sim/run_link_timeout_matrix.sh
+bash uvm/sim/run_uvm_vcs.sh ace_link_order_test
+```
+
+mask映射：`001/002/004/008/010/020/040/080/100/200`分别对应
+`AW/W/B/AR/R/AC/CR/CD/RACK/WACK`。
+
+第三个参数可以直接指定单个通道mask，例如：
+
+```bash
+bash uvm/sim/run_uvm_vcs.sh ace_link_delay_test 0 020
+bash uvm/sim/run_uvm_vcs.sh ace_link_timeout_test 0 040
+```
+
+本地非UVM基础回归及链路模块单元测试：
+
+```bash
+bash sim/run_local.sh
+
+mkdir -p sim/build
+iverilog -g2012 -D__ICARUS__ -s tb_link_delay \
+  -o sim/build/link_delay.vvp \
+  rtl/link/ace_ucie_link_model.sv sim/tb_link_delay.sv
+vvp sim/build/link_delay.vvp
+```
+
+结果判定：
+
+- 正常UVM测试：`UVM_ERROR : 0`、`UVM_FATAL : 0`并出现`TEST_PASS`；
+- timeout负向测试：观察到预期timeout、没有其他功能错误并出现`TEST_PASS`；
+- 本地基础回归：出现`TB_PASS`和`SMOKE PASS`；
+- 链路模块单元测试：出现`LINK_DELAY_TEST_PASS`。
+
+前三个功能test都会伴随 home 自动出题质询；收尾等待 500 拍供 home 完成最后的质询
 与 CD 收货。完整用例空间 = **3 test × 4 码型 = 12 格**。
 命令行上的名字（`+UVM_TESTNAME`）选的是 test；剧本由 test 的 run_phase 内部
 创建并启动——考试与试卷分离，可自由组合。
@@ -220,4 +279,3 @@ B home: 后续质询该行 → A 应答 CRRESP|IsShared(留副本) → 目录降
 [1]=期望应答取反——"该报错的必须报"）。
 
 ---
-

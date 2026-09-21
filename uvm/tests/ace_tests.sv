@@ -40,6 +40,88 @@ class ace_base_test extends uvm_test;
 
 endclass
 
+class ace_link_order_test extends ace_base_test;
+  `uvm_component_utils(ace_link_order_test)
+  function new(string name="ace_link_order_test", uvm_component parent=null);
+    super.new(name,parent);
+  endfunction
+  task run_phase(uvm_phase phase);
+    ace_random_seq seq;
+    phase.raise_objection(this);
+    env.agent.drv.vif.replay_delay_active=1'b1;
+    env.agent.drv.vif.retrain_link_active=1'b0;
+    env.agent.drv.vif.delay_cycles=16'd4;
+    env.agent.drv.vif.delay_channel_mask=10'h3ff;
+    seq=ace_random_seq::type_id::create("seq");
+    seq.start(env.agent.sqr);
+    repeat(1000) @(posedge env.agent.drv.vif.aclk);
+    phase.drop_objection(this);
+  endtask
+endclass
+
+class ace_link_delay_test extends ace_base_test;
+  `uvm_component_utils(ace_link_delay_test)
+  function new(string name="ace_link_delay_test", uvm_component parent=null);
+    super.new(name,parent);
+  endfunction
+  task run_phase(uvm_phase phase);
+    ace_write_read_seq seq;
+    int unsigned link_mask;
+    phase.raise_objection(this);
+    link_mask = 10'h001;
+    void'($value$plusargs("LINK_DELAY_MASK=%h", link_mask));
+    env.agent.drv.vif.replay_delay_active = 1'b1;
+    env.agent.drv.vif.retrain_link_active = 1'b0;
+    env.agent.drv.vif.delay_cycles = 16'd4;
+    env.agent.drv.vif.delay_channel_mask = link_mask[9:0];
+    seq = ace_write_read_seq::type_id::create("seq");
+    seq.start(env.agent.sqr);
+    repeat (700) @(posedge env.agent.drv.vif.aclk);
+    env.agent.drv.vif.replay_delay_active = 1'b0;
+    phase.drop_objection(this);
+  endtask
+endclass
+
+class ace_link_timeout_test extends ace_base_test;
+  `uvm_component_utils(ace_link_timeout_test)
+  function new(string name="ace_link_timeout_test", uvm_component parent=null);
+    super.new(name,parent);
+  endfunction
+  task run_phase(uvm_phase phase);
+    ace_write_read_seq seq;
+    int unsigned timeout_mask;
+    bit timeout_seen;
+    phase.raise_objection(this);
+    timeout_mask = 10'h001;
+    void'($value$plusargs("LINK_DELAY_MASK=%h", timeout_mask));
+    env.agent.drv.vif.expect_timeout = 1'b1;
+    env.agent.drv.vif.replay_delay_active = 1'b0;
+    env.agent.drv.vif.retrain_link_active = 1'b1;
+    env.agent.drv.vif.delay_cycles = 16'd300;
+    env.agent.drv.vif.delay_channel_mask = timeout_mask[9:0];
+    seq = ace_write_read_seq::type_id::create("seq");
+    fork
+      seq.start(env.agent.sqr);
+    join_none
+    timeout_seen = 1'b0;
+    for (int unsigned wait_cycle=0; wait_cycle<1500 && !timeout_seen; wait_cycle++) begin
+      @(posedge env.agent.drv.vif.aclk);
+      timeout_seen = env.agent.drv.vif.err_main_timeout_a ||
+                     env.agent.drv.vif.err_snoop_timeout_a ||
+                     env.agent.drv.vif.err_slave_timeout_b ||
+                     env.agent.drv.vif.err_snoop_timeout_b;
+    end
+    if (!timeout_seen)
+      `uvm_error("TIMEOUT_TEST", $sformatf(
+        "mask=%03h，1500拍内未观察到预期timeout", timeout_mask[9:0]))
+    else
+      `uvm_info("TIMEOUT_TEST", $sformatf(
+        "mask=%03h，观察到预期timeout", timeout_mask[9:0]), UVM_LOW)
+    disable fork;
+    phase.drop_objection(this);
+  endtask
+endclass
+
 
 // ---------------------------------------------------------------------
 // ace_smoke_test: 数据面地基回归 (每次 RTL 改动后的第一反应)

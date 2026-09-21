@@ -132,10 +132,15 @@ module module_a (
   output logic                 err_wr_prbs,     // 写数据生成自检 (恒 0)
   output logic [31:0]          o_cnt_tx,        // 完成读+写事务计数
   output logic [31:0]          o_cnt_snoop,     // 已应答 snoop 计数
+  output logic                 err_main_timeout,
+  output logic                 err_snoop_timeout,
+  output logic [15:0]          o_main_wait_cnt,
+  output logic [15:0]          o_snoop_wait_cnt,
   output logic                 o_any_err
 );
 
   localparam int IDX_W = $clog2(N_LINES);
+  localparam int ACE_TIMEOUT = 256;
 
   // =====================================================================
   // ⑤ PRBS 单元 (纯函数, 两端同公式; 函数体见 ace_funcs.svh)
@@ -586,6 +591,39 @@ module module_a (
   // 校验 / 计数 / 状态输出
   // =====================================================================
   logic err_rd_data_q, err_rsp_q;
+  logic err_main_timeout_q, err_snoop_timeout_q;
+  logic main_progress, snoop_progress;
+
+  assign main_progress = (awvalid && awready) || (wvalid && wready) ||
+                         (bvalid && bready) || (arvalid && arready) ||
+                         (rvalid && rready);
+  assign snoop_progress = (acvalid && acready) || (crvalid && crready) ||
+                          (cdvalid && cdready);
+
+  always_ff @(posedge aclk or negedge areset_n) begin
+    if (!areset_n || cfg_err_clr) begin
+      o_main_wait_cnt    <= '0;
+      o_snoop_wait_cnt   <= '0;
+      err_main_timeout_q <= 1'b0;
+      err_snoop_timeout_q<= 1'b0;
+    end else begin
+      if ((st == M_IDLE) || main_progress)
+        o_main_wait_cnt <= '0;
+      else if (o_main_wait_cnt < ACE_TIMEOUT)
+        o_main_wait_cnt <= o_main_wait_cnt + 1'b1;
+      if ((st != M_IDLE) && !main_progress &&
+          (o_main_wait_cnt == ACE_TIMEOUT-1))
+        err_main_timeout_q <= 1'b1;
+
+      if ((sn == S_IDLE) || snoop_progress)
+        o_snoop_wait_cnt <= '0;
+      else if (o_snoop_wait_cnt < ACE_TIMEOUT)
+        o_snoop_wait_cnt <= o_snoop_wait_cnt + 1'b1;
+      if ((sn != S_IDLE) && !snoop_progress &&
+          (o_snoop_wait_cnt == ACE_TIMEOUT-1))
+        err_snoop_timeout_q <= 1'b1;
+    end
+  end
 
   always_ff @(posedge aclk or negedge areset_n) begin
     if (!areset_n || cfg_err_clr) begin
@@ -616,7 +654,10 @@ module module_a (
 
   assign err_rd_data = err_rd_data_q;
   assign err_rsp     = err_rsp_q;
-  assign o_any_err   = err_rd_data_q | err_rsp_q | err_wr_prbs;
+  assign err_main_timeout  = err_main_timeout_q;
+  assign err_snoop_timeout = err_snoop_timeout_q;
+  assign o_any_err   = err_rd_data_q | err_rsp_q | err_wr_prbs |
+                       err_main_timeout_q | err_snoop_timeout_q;
 
   always_ff @(posedge aclk or negedge areset_n) begin
     if (!areset_n)                o_cnt_tx <= '0;

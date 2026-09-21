@@ -120,6 +120,9 @@ module module_b (
   output logic                 err_cd_data,     // CD 收货数据 ≠ 期望码型
   output logic                 err_cr_mismatch, // CRRESP ≠ 目录预期
   output logic                 err_snoop_timeout,
+  output logic                 err_slave_timeout,
+  output logic [15:0]          o_slave_wait_cnt,
+  output logic [15:0]          o_home_wait_cnt,
   output logic [31:0]          o_cnt_wr,
   output logic [31:0]          o_cnt_rd,
   output logic [31:0]          o_cnt_snoop,
@@ -452,6 +455,7 @@ module module_b (
               to_cnt  <= '0;
               hs      <= H_WAIT_CR;
             end else begin
+              to_cnt  <= '0;
               hs      <= H_SEND_AC;
             end
           end else if (gap_cnt != 0) begin
@@ -463,6 +467,10 @@ module module_b (
             vid_cnt  <= vid_cnt + 1'b1;
             to_cnt   <= '0;
             hs       <= H_WAIT_CR;
+          end else if (to_cnt == SNOOP_TIMEOUT-1) begin
+            hs <= H_IDLE;
+          end else begin
+            to_cnt <= to_cnt + 1'b1;
           end
         end
         H_WAIT_CR: begin
@@ -513,6 +521,27 @@ module module_b (
   // 校验 / 计数 / 状态输出
   // =====================================================================
   logic err_cd_data_q;                                 // 提前声明 (CD 数据校验)
+  logic err_slave_timeout_q;
+  logic slave_progress;
+  assign slave_progress = (awvalid && awready) || (wvalid && wready) ||
+                          (bvalid && bready) || (arvalid && arready) ||
+                          (rvalid && rready);
+
+  always_ff @(posedge aclk or negedge areset_n) begin
+    if (!areset_n || cfg_err_clr) begin
+      o_slave_wait_cnt   <= '0;
+      err_slave_timeout_q<= 1'b0;
+    end else begin
+      if ((st == B_IDLE) || slave_progress)
+        o_slave_wait_cnt <= '0;
+      else if (o_slave_wait_cnt < SNOOP_TIMEOUT)
+        o_slave_wait_cnt <= o_slave_wait_cnt + 1'b1;
+      if ((st != B_IDLE) && !slave_progress &&
+          (o_slave_wait_cnt == SNOOP_TIMEOUT-1))
+        err_slave_timeout_q <= 1'b1;
+    end
+  end
+  assign o_home_wait_cnt = {{7{1'b0}}, to_cnt};
 
   always_ff @(posedge aclk or negedge areset_n) begin
     if (!areset_n || cfg_err_clr) begin
@@ -528,7 +557,10 @@ module module_b (
       if (cdvalid && cdready &&
           (cddata != beat_data(to_line(h_addr_l), 8'd0)))
         err_cd_data_q <= 1'b1;
-      // 质询超时 (等 CR / 等 CD 两个窗口共用闹钟)
+      // 质询超时 (发送 AC、等待 CR、等待 CD 三个窗口共用闹钟)
+      if ((hs == H_SEND_AC) && (to_cnt == SNOOP_TIMEOUT-1) &&
+          !(acvalid && acready))
+        err_snoop_timeout_q <= 1'b1;
       if ((hs == H_WAIT_CR) && (to_cnt == SNOOP_TIMEOUT-1) && !crvalid)
         err_snoop_timeout_q <= 1'b1;
       if ((hs == H_WAIT_CD) && (to_cnt == SNOOP_TIMEOUT-1) && !cdvalid)
@@ -543,8 +575,9 @@ module module_b (
   assign err_cd_data       = err_cd_data_q;
   assign err_cr_mismatch   = err_cr_mismatch_q;
   assign err_snoop_timeout = err_snoop_timeout_q;
+  assign err_slave_timeout = err_slave_timeout_q;
   assign o_any_err = err_wr_data_q | err_cd_data_q | err_cr_mismatch_q |
-                     err_snoop_timeout_q;
+                     err_snoop_timeout_q | err_slave_timeout_q;
 
   always_ff @(posedge aclk or negedge areset_n) begin
     if (!areset_n)        o_cnt_wr <= '0;
