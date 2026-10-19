@@ -48,16 +48,38 @@ class ace_monitor extends uvm_monitor;
       // ③ DUT 错误标志 (锁存式, 每侧只报一次)
       if (vif.any_err_a && !err_reported_a) begin
         err_reported_a = 1;
-        `uvm_error("DUT_A_ERR", $sformatf(
-          "Module A 错误: rd=%b rsp=%b wrprbs=%b",
-          vif.err_rd_data_a, vif.err_rsp_a, vif.err_wr_prbs_a))
+        if (vif.expect_timeout &&
+            (vif.err_main_timeout_a || vif.err_snoop_timeout_a) &&
+            !vif.err_rd_data_a && !vif.err_rsp_a && !vif.err_wr_prbs_a)
+          `uvm_info("EXPECTED_TIMEOUT", $sformatf(
+          {"观察到预期Module A timeout: main=%b snoop=%b ",
+           "state(A/sn/B/home)=%0d/%0d/%0d/%0d wait=%0d/%0d/%0d/%0d pending=%010b"},
+          vif.err_main_timeout_a, vif.err_snoop_timeout_a,
+          vif.st_a, vif.sn_a, vif.st_b, vif.hs_b,
+          vif.main_wait_cnt_a, vif.snoop_wait_cnt_a,
+          vif.slave_wait_cnt_b, vif.home_wait_cnt_b, vif.channel_pending), UVM_LOW)
+        else
+          `uvm_error("DUT_A_ERR", $sformatf(
+          {"Module A 错误: rd=%b rsp=%b wrprbs=%b main_to=%b snoop_to=%b ",
+           "state(A/sn/B/home)=%0d/%0d/%0d/%0d wait(A/sn/B/home)=%0d/%0d/%0d/%0d delay=%010b pending=%010b"},
+          vif.err_rd_data_a, vif.err_rsp_a, vif.err_wr_prbs_a,
+          vif.err_main_timeout_a, vif.err_snoop_timeout_a,
+          vif.st_a, vif.sn_a, vif.st_b, vif.hs_b,
+          vif.main_wait_cnt_a, vif.snoop_wait_cnt_a,
+          vif.slave_wait_cnt_b, vif.home_wait_cnt_b,
+          vif.channel_delay_active, vif.channel_pending))
       end
       if (vif.any_err_b && !err_reported_b) begin
         err_reported_b = 1;
-        `uvm_error("DUT_B_ERR", $sformatf(
-          "Module B 错误: wr=%b cd=%b cr=%b to=%b",
+        if (vif.expect_timeout &&
+            (vif.err_snoop_timeout_b || vif.err_slave_timeout_b) &&
+            !vif.err_wr_data_b && !vif.err_cd_data_b && !vif.err_cr_mismatch_b)
+          `uvm_info("EXPECTED_TIMEOUT", "观察到预期Module B timeout", UVM_LOW)
+        else
+          `uvm_error("DUT_B_ERR", $sformatf(
+          "Module B 错误: wr=%b cd=%b cr=%b snoop_to=%b slave_to=%b",
           vif.err_wr_data_b, vif.err_cd_data_b, vif.err_cr_mismatch_b,
-          vif.err_snoop_timeout_b))
+          vif.err_snoop_timeout_b, vif.err_slave_timeout_b))
       end
     end
   endtask

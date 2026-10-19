@@ -27,7 +27,11 @@ interface ace_if (input logic aclk, input logic areset_n);
   // ---- 被动观测 : DUT 状态 ----
   logic                any_err_a, any_err_b;
   logic                err_rd_data_a, err_rsp_a, err_wr_prbs_a;
+  logic                err_main_timeout_a, err_snoop_timeout_a;
   logic                err_wr_data_b, err_cd_data_b, err_cr_mismatch_b, err_snoop_timeout_b;
+  logic                err_slave_timeout_b;
+  logic [15:0]         main_wait_cnt_a, snoop_wait_cnt_a;
+  logic [15:0]         slave_wait_cnt_b, home_wait_cnt_b;
   logic [31:0]         cnt_tx, cnt_snoop_a, cnt_snoop_b;
   logic [31:0]         cnt_wr, cnt_rd;
 
@@ -43,8 +47,14 @@ interface ace_if (input logic aclk, input logic areset_n);
 
   // ---- P3-1 码型 (tb_top 经 +DATA_MODE 设置, 运行期常量) ----
   //      供 coverage 采样与测试报告; 运行中途不可切换 (内存/快照与期望值失配)
-  logic [1:0]          cfg_data_mode;
+  logic [2:0]          cfg_data_mode;
   logic [7:0]          cfg_xcode;
+  logic                replay_delay_active, retrain_link_active;
+  logic [15:0]         delay_cycles;
+  logic [9:0]          delay_channel_mask, channel_delay_active, channel_pending;
+  logic                expect_timeout;
+  logic [15:0]         link_in_cnt [10];
+  logic [15:0]         link_out_cnt[10];
 
 endinterface
 

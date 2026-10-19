@@ -1,0 +1,9 @@
+$CLCI_RELEASE_ANCHOR/dv/src/clci_common.defines.sv
+$CLCI_RELEASE_ANCHOR/dv/src/clci_dv_manual_slip.sv
+$CLCI_RELEASE_ANCHOR/dv/src/clci_top_bind.sv
+$CLCI_RELEASE_ANCHOR/dv/src/clci_init_mem.sv
++incdir+$CLCI_RELEASE_ANCHOR/ace-full-project/rtl
+$CLCI_RELEASE_ANCHOR/ace-full-project/rtl/ace_pkg.sv
+$CLCI_RELEASE_ANCHOR/ace-full-project/rtl/module_a.sv
+$CLCI_RELEASE_ANCHOR/ace-full-project/rtl/module_b.sv
+$CLCI_RELEASE_ANCHOR/dv/src/top.sv

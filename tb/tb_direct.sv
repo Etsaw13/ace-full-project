@@ -21,14 +21,26 @@ module tb_direct;
   always #(CYC/2.0) aclk = ~aclk;
 
   // ---------------- tb 配置 ----------------
-  logic cfg_en, cfg_err_clr;
   logic [3:0]        cfg_scenario_a;
   logic [7:0]        cfg_prbs_code;
-  logic [1:0]        cfg_data_mode;    // P3-1: 数据码型 (+DATA_MODE=0..3, 默认 0)
+  logic [2:0]        cfg_data_mode;    // 数据码型 (+DATA_MODE=0..5, 默认 PRBS31)
+  integer            cfg_burst_beats; // Burst实际拍数 (+BURST_BEATS=2..256)
   logic [7:0]        cfg_xcode;        // P3-1: 全同字节码型字节值
   logic [ADDR_W-1:0] cfg_base_addr;
   logic [7:0]        cfg_snoop_gap;
   logic [3:0]        cfg_err_inject_b;
+
+  // ---------------- APB3 configuration buses ----------------
+  logic        a_psel, a_penable, a_pwrite;
+  logic [11:0] a_paddr;
+  logic [31:0] a_pwdata;
+  wire  [31:0] a_prdata;
+  wire         a_pready, a_pslverr;
+  logic        b_psel, b_penable, b_pwrite;
+  logic [11:0] b_paddr;
+  logic [31:0] b_pwdata;
+  wire  [31:0] b_prdata;
+  wire         b_pready, b_pslverr;
 
   // ---------------- 通道连线 (A↔B 直连) ----------------
   // AW (A→B)
@@ -118,13 +130,11 @@ module tb_direct;
     .crvalid(crvalid), .crready(crready), .crresp(crresp),
     .cdvalid(cdvalid), .cdready(cdready), .cddata(cddata), .cdlast(cdlast),
     .rack(rack), .wack(wack),
-    .cfg_en(cfg_en), .cfg_scenario(cfg_scenario_a), .cfg_prbs_code(cfg_prbs_code),
-    .cfg_data_mode(cfg_data_mode), .cfg_xcode(cfg_xcode),
-    .cfg_base_addr(cfg_base_addr), .cfg_err_clr(cfg_err_clr),
+    .pclk(aclk), .presetn(areset_n), .psel(a_psel), .penable(a_penable),
+    .pwrite(a_pwrite), .paddr(a_paddr), .pwdata(a_pwdata),
+    .prdata(a_prdata), .pready(a_pready), .pslverr(a_pslverr),
     .ord_valid(1'b0), .ord_ready(), .ord_write(1'b0), .ord_arsnoop('0),
-    .ord_awsnoop('0), .ord_awunique(1'b0), .ord_addr('0), .cfg_ord_ext(1'b0),
-    .err_rd_data(err_rd_data_a), .err_rsp(err_rsp_a), .err_wr_prbs(err_wr_prbs_a),
-    .o_cnt_tx(cnt_tx), .o_cnt_snoop(cnt_snoop_a), .o_any_err(any_err_a)
+    .ord_awsnoop('0), .ord_awunique(1'b0), .ord_addr('0), .cfg_ord_ext(1'b0)
   );
 
   // ---------------- DUT: Module B (slave + home) ----------------
@@ -147,15 +157,26 @@ module tb_direct;
     .crvalid(crvalid), .crready(crready), .crresp(crresp),
     .cdvalid(cdvalid), .cdready(cdready), .cddata(cddata), .cdlast(cdlast),
     .rack(rack), .wack(wack),
-    .cfg_en(cfg_en), .cfg_prbs_code(cfg_prbs_code),
-    .cfg_data_mode(cfg_data_mode), .cfg_xcode(cfg_xcode),
-    .cfg_snoop_gap(cfg_snoop_gap),
-    .cfg_err_inject(cfg_err_inject_b), .cfg_err_clr(cfg_err_clr),
-    .err_wr_data(err_wr_data_b), .err_cd_data(err_cd_data_b),
-    .err_cr_mismatch(err_cr_b), .err_snoop_timeout(err_to_b),
-    .o_cnt_wr(cnt_wr), .o_cnt_rd(cnt_rd), .o_cnt_snoop(cnt_snoop_b),
-    .o_any_err(any_err_b)
+    .pclk(aclk), .presetn(areset_n), .psel(b_psel), .penable(b_penable),
+    .pwrite(b_pwrite), .paddr(b_paddr), .pwdata(b_pwdata),
+    .prdata(b_prdata), .pready(b_pready), .pslverr(b_pslverr)
   );
+
+  // 状态已经是 APB 可读内部寄存器。层次连接仅供实时完成条件和波形观测。
+  assign err_rd_data_a = u_a.err_rd_data;
+  assign err_rsp_a     = u_a.err_rsp;
+  assign err_wr_prbs_a = u_a.err_wr_prbs;
+  assign any_err_a     = u_a.o_any_err;
+  assign cnt_tx        = u_a.o_cnt_tx;
+  assign cnt_snoop_a   = u_a.o_cnt_snoop;
+  assign err_wr_data_b = u_b.err_wr_data;
+  assign err_cd_data_b = u_b.err_cd_data;
+  assign err_cr_b      = u_b.err_cr_mismatch;
+  assign err_to_b      = u_b.err_snoop_timeout;
+  assign any_err_b     = u_b.o_any_err;
+  assign cnt_wr        = u_b.o_cnt_wr;
+  assign cnt_rd        = u_b.o_cnt_rd;
+  assign cnt_snoop_b   = u_b.o_cnt_snoop;
 
   // ---------------- 轻量 SVA (design_report §7.1 第 3 层) ----------------
   // iverilog 不支持并发断言: 本地跑时加 -D IVERILOG 关闭 (VCS 默认开启)
@@ -237,22 +258,58 @@ module tb_direct;
     if ((^payload_bus) === 1'bx)
       $display("[XDET-P %0t] X in PAYLOAD bus (首现后不再重复打印)", $time);
 
+  task automatic apb_a_write(input logic [11:0] addr,
+                             input logic [31:0] data);
+    begin
+      @(negedge aclk);
+      a_psel = 1'b1; a_penable = 1'b0; a_pwrite = 1'b1;
+      a_paddr = addr; a_pwdata = data;
+      @(negedge aclk);
+      a_penable = 1'b1;
+      @(negedge aclk);
+      if (!a_pready || a_pslverr) $fatal(1, "Module A APB write failed: %03h", addr);
+      a_psel = 1'b0; a_penable = 1'b0; a_pwrite = 1'b0;
+    end
+  endtask
+
+  task automatic apb_b_write(input logic [11:0] addr,
+                             input logic [31:0] data);
+    begin
+      @(negedge aclk);
+      b_psel = 1'b1; b_penable = 1'b0; b_pwrite = 1'b1;
+      b_paddr = addr; b_pwdata = data;
+      @(negedge aclk);
+      b_penable = 1'b1;
+      @(negedge aclk);
+      if (!b_pready || b_pslverr) $fatal(1, "Module B APB write failed: %03h", addr);
+      b_psel = 1'b0; b_penable = 1'b0; b_pwrite = 1'b0;
+    end
+  endtask
+
   // ---------------- 主流程 ----------------
   initial begin
-    cfg_en          = 1'b0;
-    cfg_err_clr     = 1'b0;
+    a_psel = 1'b0; a_penable = 1'b0; a_pwrite = 1'b0;
+    a_paddr = '0; a_pwdata = '0;
+    b_psel = 1'b0; b_penable = 1'b0; b_pwrite = 1'b0;
+    b_paddr = '0; b_pwdata = '0;
     cfg_scenario_a  = '0;
     cfg_prbs_code   = 8'hA5;
-    cfg_data_mode   = 2'd0;                 // P3-1: 默认 PRBS
+    cfg_data_mode   = 3'd0;                 // 默认 PRBS31
+    cfg_burst_beats = 4;
     cfg_xcode       = 8'h5A;
     if (!$value$plusargs("DATA_MODE=%d", cfg_data_mode)) begin
       // plusarg 未提供时: 编译期 define 兜底 (+define+DATA_MODE=n)
 `ifdef DATA_MODE
       cfg_data_mode = `DATA_MODE;
 `else
-      cfg_data_mode = 2'd0;
+      cfg_data_mode = 3'd0;
 `endif
     end
+    if (cfg_data_mode > 3'd5)
+      $fatal(1, "DATA_MODE must be 0..5");
+    if ($value$plusargs("BURST_BEATS=%d", cfg_burst_beats)) begin end
+    if ((cfg_burst_beats < 2) || (cfg_burst_beats > 256))
+      $fatal(1, "BURST_BEATS must be 2..256");
     // 注: mode 为运行期常量, 一次仿真一个码型 (中途切换会假报错, 见 P3-1)
     cfg_base_addr   = 44'h2000_0000;
     cfg_snoop_gap   = 8'd10;
@@ -261,8 +318,17 @@ module tb_direct;
     areset_n = 1'b0;
     repeat (10) @(posedge aclk);
     areset_n = 1'b1;
-    repeat (5)  @(posedge aclk);
-    cfg_en = 1'b1;
+    repeat (2) @(posedge aclk);
+    apb_a_write(12'h004, {4'b0, cfg_scenario_a, cfg_xcode, 5'b0,
+                          cfg_data_mode, cfg_prbs_code});
+    apb_a_write(12'h008, cfg_base_addr[31:0]);
+    apb_a_write(12'h00c, {20'b0, cfg_base_addr[43:32]});
+    apb_a_write(12'h020, cfg_burst_beats - 1);
+    apb_b_write(12'h004, {8'b0, cfg_xcode, 5'b0,
+                          cfg_data_mode, cfg_prbs_code});
+    apb_b_write(12'h008, {20'b0, cfg_err_inject_b, cfg_snoop_gap});
+    apb_b_write(12'h000, 32'h1);
+    apb_a_write(12'h000, 32'h1);
   end
 
   // ---------------- 调试观测 (默认关闭; 编译加 +define+DBG / -D DBG 开启) ----------------
@@ -331,10 +397,12 @@ module tb_direct;
   initial begin
     @(posedge done);
     repeat (50) @(posedge aclk);        // 留最后一笔 snoop 收尾
-    cfg_en = 1'b0;
+    apb_a_write(12'h000, 32'h0);
+    apb_b_write(12'h000, 32'h0);
 
     $display("==================================================");
-    $display(" 结果汇总: (data_mode=%0d)", cfg_data_mode);
+    $display(" 结果汇总: (data_mode=%0d burst_beats=%0d)",
+             cfg_data_mode, cfg_burst_beats);
     $display("   A: cnt_tx=%0d cnt_snoop=%0d any_err=%b (rd=%b rsp=%b wrprbs=%b)",
              cnt_tx, cnt_snoop_a, any_err_a, err_rd_data_a, err_rsp_a, err_wr_prbs_a);
     $display("   B: cnt_wr=%0d cnt_rd=%0d cnt_snoop=%0d cnt_cd=%0d any_err=%b (wr=%b cd=%b cr=%b to=%b)",

@@ -15,8 +15,9 @@
 //   - WriteLineUnique 直写式: 数据照进内存, 行保留 UC + 刷新快照
 //   - UD 行被质询: 统一应答 DT|PassDirty|WasUnique 并经 CD 交整行, 行→I
 //   - RRESP 合法性: 低 2 位 OKAY; PassDirty 仅 RU; IsShared 仅 RS
-//   - burst: 单拍 (awlen/arlen = 0), 1 拍 = 1 行 (16B); CD 同为单拍
-//   - cfg_err_clr 为端口表之外的补充引脚 (错误锁存清除)
+//   - main traffic rotates Single Write / Single Read / configurable Burst Write /
+//     Burst Read; one beat is one 16B cache line. CD remains single-beat.
+//   - 配置、错误状态和计数器均映射为 APB 寄存器；外部订单入口保持独立
 // =====================================================================
 `timescale 1ns / 1ps
 `default_nettype none
@@ -107,14 +108,18 @@ module module_a (
   output logic                 rack,
   output logic                 wack,
 
-  // ---------------- tb 配置 ----------------
-  input  wire                  cfg_en,
-  input  wire [3:0]            cfg_scenario,    // 预留 (初版单一场景)
-  input  wire [7:0]            cfg_prbs_code,   // PRBS 种子 (mode=0 用, 与 B 同配)
-  input  wire [1:0]            cfg_data_mode,   // 数据码型 (P3-1, 与 B 同配)
-  input  wire [7:0]            cfg_xcode,       // 全同字节码型 (P3-1, 与 B 同配)
-  input  wire [ADDR_W-1:0]     cfg_base_addr,
-  input  wire                  cfg_err_clr,     // 错误锁存清除 (补充引脚)
+  // ---------------- APB3 configuration/status slave ----------------
+  // PCLK must be synchronous to ACLK in this implementation.
+  input  wire                  pclk,
+  input  wire                  presetn,
+  input  wire                  psel,
+  input  wire                  penable,
+  input  wire                  pwrite,
+  input  wire [11:0]           paddr,
+  input  wire [31:0]           pwdata,
+  output logic [31:0]          prdata,
+  output logic                 pready,
+  output logic                 pslverr,
 
   // ---------------- 外部订单入口 (UVM/tb 驱动; cfg_ord_ext=1 时生效) ----------------
   input  wire                  ord_valid,       // 外部订单有效
@@ -124,18 +129,103 @@ module module_a (
   input  wire [2:0]            ord_awsnoop,     // 写属性 (写订单有效)
   input  wire                  ord_awunique,    // 写独占标记
   input  wire [ADDR_W-1:0]     ord_addr,        // 目标地址 (行对齐)
-  input  wire                  cfg_ord_ext,     // 订单来源: 1=外部 0=内部计数器
-
-  // ---------------- tb 状态 ----------------
-  output logic                 err_rd_data,     // 读数据 ≠ 期望码型
-  output logic                 err_rsp,         // BRESP/RRESP 不合法
-  output logic                 err_wr_prbs,     // 写数据生成自检 (恒 0)
-  output logic [31:0]          o_cnt_tx,        // 完成读+写事务计数
-  output logic [31:0]          o_cnt_snoop,     // 已应答 snoop 计数
-  output logic                 o_any_err
+  input  wire                  cfg_ord_ext      // 订单来源: 1=外部 0=内部计数器
 );
 
   localparam int IDX_W = $clog2(N_LINES);
+  localparam int ACE_TIMEOUT = 256;
+  // APB register map (byte offsets):
+  // 000 CONTROL   RW: [0] enable, [1] error-clear pulse
+  // 004 DATA_CFG RW: [7:0] PRBS seed code, [10:8] data mode, [23:16] xcode,
+  //                  [27:24] test type: 0=all, 1=single write,
+  //                  2=single read, 3=burst write, 4=burst read
+  // 008 BASE_LO  RW: base address [31:0]
+  // 00C BASE_HI  RW: base address [43:32]
+  // 010 STATUS   RO: rd/rsp/wr-prbs/main-timeout/snoop-timeout/any-error
+  // 014 CNT_TX   RO, 018 CNT_SNOOP RO, 01C WAIT_COUNT RO
+  // 020 BURST_CFG RW: [7:0] AXI burst LEN (beats minus one), reset 3 = 4 beats
+  localparam logic [11:0] A_CONTROL    = 12'h000;
+  localparam logic [11:0] A_DATA_CFG   = 12'h004;
+  localparam logic [11:0] A_BASE_LO    = 12'h008;
+  localparam logic [11:0] A_BASE_HI    = 12'h00c;
+  localparam logic [11:0] A_STATUS     = 12'h010;
+  localparam logic [11:0] A_CNT_TX     = 12'h014;
+  localparam logic [11:0] A_CNT_SNOOP  = 12'h018;
+  localparam logic [11:0] A_WAIT_COUNT = 12'h01c;
+  localparam logic [11:0] A_BURST_CFG  = 12'h020;
+
+  logic                  cfg_en, cfg_err_clr;
+  logic [3:0]            cfg_scenario;
+  logic [7:0]            cfg_prbs_code, cfg_xcode;
+  logic [2:0]            cfg_data_mode;
+  logic [LEN_W-1:0]      cfg_burst_len;
+  logic [ADDR_W-1:0]     cfg_base_addr;
+  logic                  err_rd_data, err_rsp, err_wr_prbs;
+  logic                  err_main_timeout, err_snoop_timeout, o_any_err;
+  logic [15:0]           o_main_wait_cnt, o_snoop_wait_cnt;
+  logic [31:0]           o_cnt_tx, o_cnt_snoop;
+
+  wire apb_access = psel && penable;
+  wire apb_write  = apb_access && pwrite;
+
+  always_ff @(posedge pclk or negedge presetn) begin
+    if (!presetn) begin
+      cfg_en        <= 1'b0;
+      cfg_err_clr   <= 1'b0;
+      cfg_scenario  <= '0;
+      cfg_prbs_code <= 8'hA5;
+      cfg_data_mode <= 3'd0;
+      cfg_burst_len <= {{(LEN_W-2){1'b0}}, 2'b11}; // AXI LEN=3: four beats
+      cfg_xcode     <= 8'h5A;
+      cfg_base_addr <= 44'h2000_0000;
+    end else begin
+      cfg_err_clr <= 1'b0;
+      if (apb_write) begin
+        case (paddr)
+          A_CONTROL: begin
+            cfg_en      <= pwdata[0];
+            cfg_err_clr <= pwdata[1];
+          end
+          A_DATA_CFG: begin
+            cfg_prbs_code <= pwdata[7:0];
+            cfg_data_mode <= pwdata[10:8];
+            cfg_xcode     <= pwdata[23:16];
+            cfg_scenario  <= pwdata[27:24];
+          end
+          A_BASE_LO: cfg_base_addr[31:0]  <= pwdata;
+          A_BASE_HI: cfg_base_addr[43:32] <= pwdata[11:0];
+          A_BURST_CFG: cfg_burst_len <= pwdata[LEN_W-1:0];
+          default: begin end
+        endcase
+      end
+    end
+  end
+
+  always_comb begin
+    pready  = 1'b1;
+    pslverr = 1'b0;
+    prdata  = '0;
+    if (psel) begin
+      case (paddr)
+        A_CONTROL:    prdata = {31'b0, cfg_en};
+        A_DATA_CFG:   prdata = {4'b0, cfg_scenario, cfg_xcode, 5'b0,
+                                cfg_data_mode, cfg_prbs_code};
+        A_BASE_LO:    prdata = cfg_base_addr[31:0];
+        A_BASE_HI:    prdata = {20'b0, cfg_base_addr[43:32]};
+        A_STATUS:     prdata = {26'b0, o_any_err, err_snoop_timeout,
+                                err_main_timeout, err_wr_prbs,
+                                err_rsp, err_rd_data};
+        A_CNT_TX:     prdata = o_cnt_tx;
+        A_CNT_SNOOP:  prdata = o_cnt_snoop;
+        A_WAIT_COUNT: prdata = {o_snoop_wait_cnt, o_main_wait_cnt};
+        A_BURST_CFG:  prdata = {{(32-LEN_W){1'b0}}, cfg_burst_len};
+        default: begin
+          prdata  = '0;
+          pslverr = apb_access;
+        end
+      endcase
+    end
+  end
 
   // =====================================================================
   // ⑤ PRBS 单元 (纯函数, 两端同公式; 函数体见 ace_funcs.svh)
@@ -154,7 +244,9 @@ module module_a (
   // =====================================================================
   // ① 场景发生器: 计数器组 (内部订单源; 外部订单源见端口 ord_*)
   // =====================================================================
-  logic        wr_sel;                    // 1=下一笔写, 0=读
+  logic        wr_sel;                    // legacy/debug mirror of next operation
+  logic [1:0]  op_sel;                    // rotating operation: 0 SW, 1 SR, 2 BW, 3 BR
+  logic [1:0]  selected_op;               // APB-selected operation for the internal source
   logic [1:0]  line_idx;                  // 行号 (窗口内 4 行循环)
   logic [1:0]  pat;                       // 读属性轮转: RS/RU/RS/RO (随读推进)
   logic        wr_pat;                    // 写属性轮转: WU/WLU 交替 (随写推进)
@@ -175,6 +267,8 @@ module module_a (
   logic [3:0]       ord_arsn_l;
   logic [2:0]       ord_awsn_l;
   logic             ord_unq_l;
+  logic [LEN_W-1:0] ord_len_l;
+  logic [7:0]       main_beat_cnt;
 
   // ---- 订单来源选择 (外部 / 内部) ----
   logic              src_write;
@@ -182,18 +276,33 @@ module module_a (
   logic [3:0]        src_arsn;
   logic [2:0]        src_awsn;
   logic              src_unq;
+  logic [LEN_W-1:0]  src_len;
 
   always_comb begin
+    // TEST_TYPE only selects the internal generator. With cfg_ord_ext=1,
+    // ord_* remains the authoritative UVM/tb order source.
+    case (cfg_scenario)
+      4'd1: selected_op = 2'd0; // Single Write
+      4'd2: selected_op = 2'd1; // Single Read
+      4'd3: selected_op = 2'd2; // Burst Write
+      4'd4: selected_op = 2'd3; // Burst Read
+      default: selected_op = op_sel; // 0 and reserved values: rotate all four
+    endcase
     // 补读: 同一行紧接再发一笔 ReadShared —— 主读的 rack 已在目录登记,
     // 此笔必命中 "目录已有该行" → B 置 RRESP.IsShared → A 行落 SC (闭环二)
-    src_write = cfg_ord_ext ? ord_write : (re_rd ? 1'b0 : wr_sel);
+    src_write = cfg_ord_ext ? ord_write : (re_rd ? 1'b0 : ~selected_op[0]);
     src_line  = cfg_ord_ext ? to_line(ord_addr) : (re_rd ? re_line : cur_line);
+    src_len   = cfg_ord_ext ? '0
+              : re_rd      ? '0
+              : selected_op[1] ? cfg_burst_len : '0;
     src_arsn  = cfg_ord_ext ? ord_arsnoop
               : re_rd         ? ARSNOOP_READ_SHARED
+              : selected_op[1] ? ARSNOOP_READ_ONCE
               : (pat == 2'd1) ? ARSNOOP_READ_UNIQUE
               : (pat == 2'd3) ? ARSNOOP_READ_ONCE
               :                 ARSNOOP_READ_SHARED;
     src_awsn  = cfg_ord_ext ? ord_awsnoop
+              : selected_op[1] ? AWSNOOP_WRITE_UNIQUE
               : (wr_pat ? AWSNOOP_WRITE_LINE_UNIQUE : AWSNOOP_WRITE_UNIQUE);
     src_unq   = cfg_ord_ext ? ord_awunique : 1'b1;
   end
@@ -345,7 +454,7 @@ module module_a (
   // ---- AW 通道 ----
   assign awid     = aw_id_c;
   assign awaddr   = {ord_line_l, {LINE_SHIFT{1'b0}}};
-  assign awlen    = '0;                            // 单拍
+  assign awlen    = ord_len_l;
   assign awsize   = 3'b100;                        // 16B/拍
   assign awburst  = 2'b01;                         // INCR
   assign awregion = '0;
@@ -360,9 +469,10 @@ module module_a (
   assign awvalid  = (st == M_W_AW);
 
   // ---- W 通道 ----
-  assign wdata  = beat_data(ord_line_l, 8'd0);
+  assign wdata  = beat_data(ord_line_l + {{(TAG_W-8){1'b0}}, main_beat_cnt},
+                            main_beat_cnt);
   assign wstrb  = {STRB_W{1'b1}};
-  assign wlast  = 1'b1;                            // 单拍突发
+  assign wlast  = (main_beat_cnt == ord_len_l);
   assign wvalid = (st == M_W_W);
 
   // 写数据自检: 占位 (独立实现比对留待后续版本; 当前恒 0)
@@ -374,7 +484,7 @@ module module_a (
   // ---- AR 通道 ----
   assign arid     = ar_id_c;
   assign araddr   = {ord_line_l, {LINE_SHIFT{1'b0}}};
-  assign arlen    = '0;
+  assign arlen    = ord_len_l;
   assign arsize   = 3'b100;
   assign arburst  = 2'b01;
   assign arregion = '0;
@@ -389,7 +499,8 @@ module module_a (
 
   // ---- R 通道 ----
   logic [DATA_W-1:0] rdata_exp;
-  assign rdata_exp = beat_data(ar_line_l, 8'd0);
+  assign rdata_exp = beat_data(ar_line_l + {{(TAG_W-8){1'b0}}, main_beat_cnt},
+                               main_beat_cnt);
   // (rdata_exp 依赖 ord_line_l 锁存的行 —— M_R_AR 时已拷贝到 ar_line_l)
 
   assign rready = (st == M_R_R);
@@ -414,6 +525,7 @@ module module_a (
     if (!areset_n) begin
       st             <= M_IDLE;
       wr_sel         <= 1'b1;
+      op_sel         <= 2'd0;
       line_idx       <= '0;
       pat            <= '0;
       wr_pat         <= 1'b0;
@@ -423,6 +535,8 @@ module module_a (
       ord_arsn_l     <= ARSNOOP_READ_SHARED;
       ord_awsn_l     <= AWSNOOP_WRITE_UNIQUE;
       ord_unq_l      <= 1'b0;
+      ord_len_l      <= '0;
+      main_beat_cnt  <= '0;
     end else begin
       case (st)
         // 接受一笔订单 (内部计数器或外部端口), 锁存为工作寄存器
@@ -434,33 +548,50 @@ module module_a (
                   ord_arsn_l     <= src_arsn;
                   ord_awsn_l     <= src_awsn;
                   ord_unq_l      <= src_unq;
+                  ord_len_l      <= src_len;
+                  main_beat_cnt  <= '0;
                   if (!cfg_ord_ext) begin           // 内部源: 推进计数器
                     if (re_rd) begin
                       re_rd <= 1'b0;                // 补读完成: 恢复正常轮转
                     end else begin
-                      wr_sel <= ~wr_sel;
-                      if (!wr_sel) begin            // 主读接受: 推进行号/属性
+                      if (cfg_scenario == 4'd0 || cfg_scenario > 4'd4)
+                        op_sel <= op_sel + 1'b1;
+                      wr_sel <= selected_op[0];
+                      if (!src_write) begin         // 主读接受: 推进行号/属性
                         line_idx <= line_idx + 1'b1;
-                        pat      <= pat + 1'b1;     // RS/RU/RS/RO 轮转 (随读推进)
-                        // RU 主读不安排补读: RS 补读会把 UD 行降级成 SC,
-                        // 掐死闭环一 (脏行须存活等 home 出 CleanInvalid)
-                        if (src_arsn != ARSNOOP_READ_UNIQUE)
+                        // Burst Read is a transport/data test using ReadOnce;
+                        // only Single Read advances the coherency pattern.
+                        if (src_len == 0)
+                          pat <= pat + 1'b1;        // RS/RU/RS/RO rotation
+                        // Only a single ReadShared schedules the same-line
+                        // ReadShared reread used to cover RRESP.IsShared.
+                        if ((src_len == 0) &&
+                            (src_arsn == ARSNOOP_READ_SHARED))
                           re_rd <= 1'b1;
                       end
                       if (src_write) wr_pat <= ~wr_pat;  // 写: WU/WLU 交替
                     end
                   end
                 end
-        M_W_AW: if (awvalid && awready) st <= M_W_W;
-        M_W_W:  if (wvalid && wready)   st <= M_W_B;
+        M_W_AW: if (awvalid && awready) begin
+                  main_beat_cnt <= '0;
+                  st <= M_W_W;
+                end
+        M_W_W:  if (wvalid && wready) begin
+                  if (wlast) st <= M_W_B;
+                  else       main_beat_cnt <= main_beat_cnt + 1'b1;
+                end
         M_W_B:  if (bvalid && bready)   st <= M_IDLE;  // 回空闲: 给 snoop 握手窗口
         M_R_AR: if (arvalid && arready) begin
                   st        <= M_R_R;
                   arsnoop_l <= ord_arsn_l;
                   ar_line_l <= ord_line_l;
+                  main_beat_cnt <= '0;
                 end
-        M_R_R:  if (rvalid && rready && rlast && (rid == ar_id_c))
-                  st <= M_IDLE;  // response完成；RACK在下一拍发出
+        M_R_R:  if (rvalid && rready && (rid == ar_id_c)) begin
+                  if (rlast) st <= M_IDLE; // response完成；RACK下一拍发出
+                  else       main_beat_cnt <= main_beat_cnt + 1'b1;
+                end
         default: st <= M_IDLE;
       endcase
     end
@@ -586,6 +717,39 @@ module module_a (
   // 校验 / 计数 / 状态输出
   // =====================================================================
   logic err_rd_data_q, err_rsp_q;
+  logic err_main_timeout_q, err_snoop_timeout_q;
+  logic main_progress, snoop_progress;
+
+  assign main_progress = (awvalid && awready) || (wvalid && wready) ||
+                         (bvalid && bready) || (arvalid && arready) ||
+                         (rvalid && rready);
+  assign snoop_progress = (acvalid && acready) || (crvalid && crready) ||
+                          (cdvalid && cdready);
+
+  always_ff @(posedge aclk or negedge areset_n) begin
+    if (!areset_n || cfg_err_clr) begin
+      o_main_wait_cnt    <= '0;
+      o_snoop_wait_cnt   <= '0;
+      err_main_timeout_q <= 1'b0;
+      err_snoop_timeout_q<= 1'b0;
+    end else begin
+      if ((st == M_IDLE) || main_progress)
+        o_main_wait_cnt <= '0;
+      else if (o_main_wait_cnt < ACE_TIMEOUT)
+        o_main_wait_cnt <= o_main_wait_cnt + 1'b1;
+      if ((st != M_IDLE) && !main_progress &&
+          (o_main_wait_cnt == ACE_TIMEOUT-1))
+        err_main_timeout_q <= 1'b1;
+
+      if ((sn == S_IDLE) || snoop_progress)
+        o_snoop_wait_cnt <= '0;
+      else if (o_snoop_wait_cnt < ACE_TIMEOUT)
+        o_snoop_wait_cnt <= o_snoop_wait_cnt + 1'b1;
+      if ((sn != S_IDLE) && !snoop_progress &&
+          (o_snoop_wait_cnt == ACE_TIMEOUT-1))
+        err_snoop_timeout_q <= 1'b1;
+    end
+  end
 
   always_ff @(posedge aclk or negedge areset_n) begin
     if (!areset_n || cfg_err_clr) begin
@@ -616,7 +780,10 @@ module module_a (
 
   assign err_rd_data = err_rd_data_q;
   assign err_rsp     = err_rsp_q;
-  assign o_any_err   = err_rd_data_q | err_rsp_q | err_wr_prbs;
+  assign err_main_timeout  = err_main_timeout_q;
+  assign err_snoop_timeout = err_snoop_timeout_q;
+  assign o_any_err   = err_rd_data_q | err_rsp_q | err_wr_prbs |
+                       err_main_timeout_q | err_snoop_timeout_q;
 
   always_ff @(posedge aclk or negedge areset_n) begin
     if (!areset_n)                o_cnt_tx <= '0;

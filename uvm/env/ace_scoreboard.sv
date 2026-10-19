@@ -46,15 +46,36 @@ class ace_scoreboard extends uvm_scoreboard;
   endtask
 
   function void check_phase(uvm_phase phase);
+    int ch;
     super.check_phase(phase);
     `uvm_info("SB_SUMMARY", $sformatf(
       "scoreboard: n_ord=%0d n_snoop=%0d n_err=%0d", n_ord, n_snoop, n_err),
       UVM_LOW)
     if (n_ord == 0)
       `uvm_error("SB_CHECK", "没有任何订单被接受 (n_ord=0)")
-    if (n_err != 0)
+    if (!vif.expect_timeout) begin
+      for (ch=0; ch<10; ch++) begin
+        if (vif.link_in_cnt[ch] != vif.link_out_cnt[ch])
+          `uvm_error("LINK_COUNT", $sformatf(
+            "通道%0d输入/输出数量不一致: in=%0d out=%0d",
+            ch, vif.link_in_cnt[ch], vif.link_out_cnt[ch]))
+      end
+    end
+    if (vif.expect_timeout) begin
+      if (!(vif.err_main_timeout_a || vif.err_snoop_timeout_a ||
+            vif.err_slave_timeout_b || vif.err_snoop_timeout_b))
+        `uvm_error("SB_CHECK", "预期timeout测试未观察到timeout")
+      else if (vif.err_rd_data_a || vif.err_rsp_a || vif.err_wr_prbs_a ||
+               vif.err_wr_data_b || vif.err_cd_data_b || vif.err_cr_mismatch_b)
+        `uvm_error("SB_CHECK", $sformatf(
+          "timeout测试同时出现非预期功能错误: A(rd/rsp/prbs)=%b/%b/%b B(wr/cd/cr)=%b/%b/%b",
+          vif.err_rd_data_a, vif.err_rsp_a, vif.err_wr_prbs_a,
+          vif.err_wr_data_b, vif.err_cd_data_b, vif.err_cr_mismatch_b))
+      else
+        `uvm_info("SB_CHECK", "scoreboard 判定: EXPECTED TIMEOUT PASS", UVM_LOW)
+    end else if (n_err != 0)
       `uvm_error("SB_CHECK", $sformatf("DUT 错误标志置位过 (%0d 拍)", n_err))
-    if (n_ord > 0 && n_err == 0)
+    if (n_ord > 0 && n_err == 0 && !vif.expect_timeout)
       `uvm_info("SB_CHECK", "scoreboard 判定: PASS", UVM_LOW)
   endfunction
 

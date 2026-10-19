@@ -11,7 +11,7 @@ TB="$VIP_ROOT/examples/sverilog/amba_svt/tb_axi_svt_uvm_basic_active_passive_sys
 SRC="$SCRIPT_DIR"
 RUNNER="$TB/run_axi_svt_uvm_basic_active_passive_sys"
 TEST=${1:-ace_smoke_test}
-DMODE=${2:-0}                     # P3-1 数据码型: 0=PRBS 1=全同字节 2=序列号 3=走1
+DMODE=${2:-0}                     # 0=PRBS31 1=全同字节 2=序列号 3=走1 4=PRBS23 5=PRBS10
 LOG="$P/passive_vip_mode${DMODE}.log"
 
 cd "$W"

@@ -6,7 +6,7 @@
 //   ① slave 引擎 : 主 FSM (B_W→B_B / B_R), RRESP 标签生成, 写数据 PRBS 互核
 //   ② home node  : 目录驱动质询发起 (空闲门控) + CR 逐位校验 + CD 收货 + 超时保护
 //   ③ 共享状态单元: 目录(4行,4态镜像) + 内存阵列(4行128b, 空行=PRBS)
-//   ④ PRBS 单元  : ace_pkg::prbs128, 与 Module A 同公式
+//   ④ 数据码型单元: PRBS31/PRBS23/PRBS10及固定模式，与 Module A 同公式
 //
 // 关键约定:
 //   - 串行事务: AW/AR 仅在空闲时接收 (背压即合法, 支持后续 Mode B 重叠)
@@ -15,7 +15,7 @@
 //   - CD 收货: DT=1 时接收整行, PRBS 逐位校验 (err_cd_data), 写内存, 目录销账
 //   - 目录在 rack/wack 时刻登记 (与 A 的行状态镜像), 质询完成时销账/降级
 //   - cfg_err_inject[0]=BRESP 回 SLVERR; [1]=期望应答取反 (反验校验器)
-//   - cfg_err_clr 为端口表之外的补充引脚 (错误锁存清除)
+//   - 配置、错误状态和计数器均映射为 APB 寄存器
 // =====================================================================
 `timescale 1ns / 1ps
 `default_nettype none
@@ -106,32 +106,111 @@ module module_b (
   input  wire                  rack,
   input  wire                  wack,
 
-  // ---------------- tb 配置 ----------------
-  input  wire                  cfg_en,
-  input  wire [7:0]            cfg_prbs_code,   // PRBS 种子 (mode=0 用, 与 A 同配)
-  input  wire [1:0]            cfg_data_mode,   // 数据码型 (P3-1, 与 A 同配)
-  input  wire [7:0]            cfg_xcode,       // 全同字节码型 (P3-1, 与 A 同配)
-  input  wire [7:0]            cfg_snoop_gap,   // 两次质询间隔拍数
-  input  wire [3:0]            cfg_err_inject,  // [0]=BRESP SLVERR [1]=期望取反
-  input  wire                  cfg_err_clr,     // 错误锁存清除 (补充引脚)
-
-  // ---------------- tb 状态 ----------------
-  output logic                 err_wr_data,     // 写数据 ≠ 期望码型
-  output logic                 err_cd_data,     // CD 收货数据 ≠ 期望码型
-  output logic                 err_cr_mismatch, // CRRESP ≠ 目录预期
-  output logic                 err_snoop_timeout,
-  output logic [31:0]          o_cnt_wr,
-  output logic [31:0]          o_cnt_rd,
-  output logic [31:0]          o_cnt_snoop,
-  output logic                 o_any_err
+  // ---------------- APB3 configuration/status slave ----------------
+  // PCLK must be synchronous to ACLK in this implementation.
+  input  wire                  pclk,
+  input  wire                  presetn,
+  input  wire                  psel,
+  input  wire                  penable,
+  input  wire                  pwrite,
+  input  wire [11:0]           paddr,
+  input  wire [31:0]           pwdata,
+  output logic [31:0]          prdata,
+  output logic                 pready,
+  output logic                 pslverr
 );
 
   localparam int IDX_W = $clog2(N_LINES);
   localparam int SNOOP_TIMEOUT = 256;
 
+  // APB register map (byte offsets):
+  // 000 CONTROL    RW: [0] home enable, [1] error-clear pulse
+  // 004 DATA_CFG   RW: [7:0] PRBS seed code, [10:8] data mode, [23:16] xcode
+  // 008 SNOOP_CFG  RW: [7:0] gap, [11:8] error injection
+  // 010 STATUS     RO: wr/cd/cr/snoop-timeout/slave-timeout/any-error
+  // 014 CNT_WR RO, 018 CNT_RD RO, 01C CNT_SNOOP RO, 020 WAIT_COUNT RO
+  localparam logic [11:0] B_CONTROL    = 12'h000;
+  localparam logic [11:0] B_DATA_CFG   = 12'h004;
+  localparam logic [11:0] B_SNOOP_CFG  = 12'h008;
+  localparam logic [11:0] B_STATUS     = 12'h010;
+  localparam logic [11:0] B_CNT_WR     = 12'h014;
+  localparam logic [11:0] B_CNT_RD     = 12'h018;
+  localparam logic [11:0] B_CNT_SNOOP  = 12'h01c;
+  localparam logic [11:0] B_WAIT_COUNT = 12'h020;
+
+  logic                  cfg_en, cfg_err_clr;
+  logic [7:0]            cfg_prbs_code, cfg_xcode, cfg_snoop_gap;
+  logic [2:0]            cfg_data_mode;
+  logic [3:0]            cfg_err_inject;
+  logic                  err_wr_data, err_cd_data, err_cr_mismatch;
+  logic                  err_snoop_timeout, err_slave_timeout, o_any_err;
+  logic [15:0]           o_slave_wait_cnt, o_home_wait_cnt;
+  logic [31:0]           o_cnt_wr, o_cnt_rd, o_cnt_snoop;
+
+  wire apb_access = psel && penable;
+  wire apb_write  = apb_access && pwrite;
+
+  always_ff @(posedge pclk or negedge presetn) begin
+    if (!presetn) begin
+      cfg_en          <= 1'b0;
+      cfg_err_clr     <= 1'b0;
+      cfg_prbs_code   <= 8'hA5;
+      cfg_data_mode   <= 3'd0;
+      cfg_xcode       <= 8'h5A;
+      cfg_snoop_gap   <= 8'd10;
+      cfg_err_inject  <= '0;
+    end else begin
+      cfg_err_clr <= 1'b0;
+      if (apb_write) begin
+        case (paddr)
+          B_CONTROL: begin
+            cfg_en      <= pwdata[0];
+            cfg_err_clr <= pwdata[1];
+          end
+          B_DATA_CFG: begin
+            cfg_prbs_code <= pwdata[7:0];
+            cfg_data_mode <= pwdata[10:8];
+            cfg_xcode     <= pwdata[23:16];
+          end
+          B_SNOOP_CFG: begin
+            cfg_snoop_gap  <= pwdata[7:0];
+            cfg_err_inject <= pwdata[11:8];
+          end
+          default: begin end
+        endcase
+      end
+    end
+  end
+
+  always_comb begin
+    pready  = 1'b1;
+    pslverr = 1'b0;
+    prdata  = '0;
+    if (psel) begin
+      case (paddr)
+        B_CONTROL:    prdata = {31'b0, cfg_en};
+        B_DATA_CFG:   prdata = {8'b0, cfg_xcode, 5'b0,
+                                cfg_data_mode, cfg_prbs_code};
+        B_SNOOP_CFG:  prdata = {20'b0, cfg_err_inject, cfg_snoop_gap};
+        B_STATUS:     prdata = {26'b0, o_any_err, err_slave_timeout,
+                                err_snoop_timeout, err_cr_mismatch,
+                                err_cd_data, err_wr_data};
+        B_CNT_WR:     prdata = o_cnt_wr;
+        B_CNT_RD:     prdata = o_cnt_rd;
+        B_CNT_SNOOP:  prdata = o_cnt_snoop;
+        B_WAIT_COUNT: prdata = {o_home_wait_cnt, o_slave_wait_cnt};
+        default: begin
+          prdata  = '0;
+          pslverr = apb_access;
+        end
+      endcase
+    end
+  end
+
   // ---- 内存阵列 (VCS 要求: 先声明后使用) ----
   logic [DATA_W-1:0]  mem [N_LINES];
   logic [N_LINES-1:0] mem_written;
+  logic [TAG_W-1:0]   mem_tag [N_LINES];
   // ---- 目录 (A 侧 cache 镜像; 声明前置: slave 引擎的 RRESP 标签需读目录) ----
   logic             dir_valid [N_LINES];
   logic [TAG_W-1:0] dir_tag   [N_LINES];
@@ -201,8 +280,9 @@ module module_b (
 
   assign r_cur_line = ar_line_l + {{(TAG_W-8){1'b0}}, beat_cnt};
   assign r_mem_idx  = r_cur_line[IDX_W-1:0];
-  assign r_mem_data = mem_written[r_mem_idx] ? mem[r_mem_idx]
-                                             : beat_data(r_cur_line, beat_cnt);
+  assign r_mem_data = (mem_written[r_mem_idx] &&
+                       (mem_tag[r_mem_idx] == r_cur_line))
+                    ? mem[r_mem_idx] : beat_data(r_cur_line, beat_cnt);
   assign r_dir_hit  = dir_valid[r_mem_idx] && (dir_tag[r_mem_idx] == r_cur_line);
   assign rvalid     = (st == B_R);
   assign rid        = ar_id_l;
@@ -274,6 +354,7 @@ module module_b (
   logic             home_dir_rm;                // 质询完成: 销账
   logic [IDX_W-1:0] home_dir_idx;
   logic [IDX_W-1:0] h_idx_l;                    // 质询目标目录项 (声明前置: CD 入库需用)
+  logic [ADDR_W-1:0] h_addr_l;                  // CD 入库及 AC 保持地址
 
   // rack/wack 时刻的目录登记来源
   always_comb begin
@@ -308,16 +389,19 @@ module module_b (
         dir_state[i]   <= ST_I;
         mem[i]         <= '0;
         mem_written[i] <= 1'b0;
+        mem_tag[i]     <= '0;
       end
     end else begin
       // 内存写入 (W 每拍 / CD 交货时)
       if (st == B_W && wvalid && wready) begin
         mem[w_mem_idx]       <= wdata;
         mem_written[w_mem_idx] <= 1'b1;
+        mem_tag[w_mem_idx]    <= w_cur_line;
       end
       if (cdvalid && cdready) begin             // CD 握手即 home 收货 (cdready 已蕴含)
         mem[h_idx_l]         <= cddata;          // 脏行写回入库 (模型写回)
         mem_written[h_idx_l] <= 1'b1;
+        mem_tag[h_idx_l]     <= h_addr_l[ADDR_W-1:LINE_SHIFT];
       end
       // 目录更新优先级: 质询完成 > rack/wack 登记 (场景约定不同拍)
       if (home_dir_rm) begin
@@ -342,7 +426,6 @@ module module_b (
   h_e hs;
 
   logic [3:0]            h_type_l;         // 已发出质询的类型锁存
-  logic [ADDR_W-1:0]     h_addr_l;         // AC阻塞期间保持稳定的地址
   logic [CRRESP_W-1:0]   h_exp_l;          // 已发出质询的期望应答锁存
   logic [1:0]            h_state_l;        // 已发出质询的目录原态锁存
   logic [1:0]            h_rot;            // 出题类型轮转: RS/MI/CI/RO
@@ -452,6 +535,7 @@ module module_b (
               to_cnt  <= '0;
               hs      <= H_WAIT_CR;
             end else begin
+              to_cnt  <= '0;
               hs      <= H_SEND_AC;
             end
           end else if (gap_cnt != 0) begin
@@ -463,6 +547,10 @@ module module_b (
             vid_cnt  <= vid_cnt + 1'b1;
             to_cnt   <= '0;
             hs       <= H_WAIT_CR;
+          end else if (to_cnt == SNOOP_TIMEOUT-1) begin
+            hs <= H_IDLE;
+          end else begin
+            to_cnt <= to_cnt + 1'b1;
           end
         end
         H_WAIT_CR: begin
@@ -513,6 +601,27 @@ module module_b (
   // 校验 / 计数 / 状态输出
   // =====================================================================
   logic err_cd_data_q;                                 // 提前声明 (CD 数据校验)
+  logic err_slave_timeout_q;
+  logic slave_progress;
+  assign slave_progress = (awvalid && awready) || (wvalid && wready) ||
+                          (bvalid && bready) || (arvalid && arready) ||
+                          (rvalid && rready);
+
+  always_ff @(posedge aclk or negedge areset_n) begin
+    if (!areset_n || cfg_err_clr) begin
+      o_slave_wait_cnt   <= '0;
+      err_slave_timeout_q<= 1'b0;
+    end else begin
+      if ((st == B_IDLE) || slave_progress)
+        o_slave_wait_cnt <= '0;
+      else if (o_slave_wait_cnt < SNOOP_TIMEOUT)
+        o_slave_wait_cnt <= o_slave_wait_cnt + 1'b1;
+      if ((st != B_IDLE) && !slave_progress &&
+          (o_slave_wait_cnt == SNOOP_TIMEOUT-1))
+        err_slave_timeout_q <= 1'b1;
+    end
+  end
+  assign o_home_wait_cnt = {{7{1'b0}}, to_cnt};
 
   always_ff @(posedge aclk or negedge areset_n) begin
     if (!areset_n || cfg_err_clr) begin
@@ -524,11 +633,18 @@ module module_b (
       // 写数据逐拍互核
       if ((st == B_W) && wvalid && wready && (wdata != w_exp))
         err_wr_data_q <= 1'b1;
+      // WLAST must agree with AWLEN: catches early and late burst termination.
+      if ((st == B_W) && wvalid && wready &&
+          (wlast != (beat_cnt == aw_len_l)))
+        err_wr_data_q <= 1'b1;
       // CD 收货数据互核 (脏行交回应为 PRBS(line) )
       if (cdvalid && cdready &&
           (cddata != beat_data(to_line(h_addr_l), 8'd0)))
         err_cd_data_q <= 1'b1;
-      // 质询超时 (等 CR / 等 CD 两个窗口共用闹钟)
+      // 质询超时 (发送 AC、等待 CR、等待 CD 三个窗口共用闹钟)
+      if ((hs == H_SEND_AC) && (to_cnt == SNOOP_TIMEOUT-1) &&
+          !(acvalid && acready))
+        err_snoop_timeout_q <= 1'b1;
       if ((hs == H_WAIT_CR) && (to_cnt == SNOOP_TIMEOUT-1) && !crvalid)
         err_snoop_timeout_q <= 1'b1;
       if ((hs == H_WAIT_CD) && (to_cnt == SNOOP_TIMEOUT-1) && !cdvalid)
@@ -543,8 +659,9 @@ module module_b (
   assign err_cd_data       = err_cd_data_q;
   assign err_cr_mismatch   = err_cr_mismatch_q;
   assign err_snoop_timeout = err_snoop_timeout_q;
+  assign err_slave_timeout = err_slave_timeout_q;
   assign o_any_err = err_wr_data_q | err_cd_data_q | err_cr_mismatch_q |
-                     err_snoop_timeout_q;
+                     err_snoop_timeout_q | err_slave_timeout_q;
 
   always_ff @(posedge aclk or negedge areset_n) begin
     if (!areset_n)        o_cnt_wr <= '0;
@@ -558,10 +675,10 @@ module module_b (
     else if (rack)        o_cnt_rd <= o_cnt_rd + 1'b1;
   end
 
-  // 未使用输入 (预留): 属性字段接收不校验, awlen 由 wlast 界定 (CD 已消费)
+  // 未使用输入 (预留): 属性字段接收不校验 (CD 已消费)
   wire unused = |{awunique, awregion, awlock, awcache, awprot, awqos, awdomain,
                   awbar, awsize, awburst, arregion, arlock, arcache, arprot,
-                  arqos, ardomain, arbar, arsize, arburst, cdlast, aw_len_l};
+                  arqos, ardomain, arbar, arsize, arburst, cdlast};
 
 endmodule
 

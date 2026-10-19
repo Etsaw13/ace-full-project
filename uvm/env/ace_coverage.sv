@@ -17,7 +17,7 @@ class ace_coverage extends uvm_subscriber #(ace_snoop_item);
   int n_ord;
 
   // ---- bin 命中位图 (get_coverage 只有 coverpoint 粒度, 精确到 bin 靠自记) ----
-  bit [3:0] seen_dmode;   // 码型 0..3
+  bit [5:0] seen_dmode;   // 码型 0..5
   bit [3:0] seen_aline;   // 目标行 0..3
   bit [5:0] seen_st_a;    // A 主 FSM 态 0..5
   bit [2:0] seen_sn_a;    // A snoop 态 0..2
@@ -26,7 +26,7 @@ class ace_coverage extends uvm_subscriber #(ace_snoop_item);
 
   // ---- 订单覆盖 (参数化采样, 与 cg_snoop 同款写法) ----
   covergroup cg_ord with function sample(bit w, bit [3:0] arsn, bit [2:0] awsn,
-                                         bit [1:0] dmode, bit [1:0] aline);
+                                         bit [2:0] dmode, bit [1:0] aline);
     cp_write:  coverpoint w { bins wr = {1}; bins rd = {0}; }
     cp_arsn:   coverpoint arsn {
       bins ro = {ARSNOOP_READ_ONCE};
@@ -39,10 +39,12 @@ class ace_coverage extends uvm_subscriber #(ace_snoop_item);
       bins wlu = {AWSNOOP_WRITE_LINE_UNIQUE};
     }
     cp_dmode:  coverpoint dmode {                 // P3-1: 码型维度
-      bins prbs   = {2'd0};
-      bins xcode  = {2'd1};
-      bins seq    = {2'd2};
-      bins walk1  = {2'd3};
+      bins prbs31 = {3'd0};
+      bins xcode  = {3'd1};
+      bins seq    = {3'd2};
+      bins walk1  = {3'd3};
+      bins prbs23 = {3'd4};
+      bins prbs10 = {3'd5};
     }
     cp_aline:  coverpoint aline {                 // 目标行 (窗口内 4 行轮转覆盖)
       bins l0 = {2'd0}; bins l1 = {2'd1};
@@ -102,6 +104,24 @@ class ace_coverage extends uvm_subscriber #(ace_snoop_item);
     }
   endgroup
 
+  covergroup cg_link;
+    cp_mode: coverpoint {vif.retrain_link_active, vif.replay_delay_active} {
+      bins normal = {2'b00}; bins replay = {2'b01}; bins retrain_link = {2'b10};
+      illegal_bins both = {2'b11};
+    }
+    cp_mask: coverpoint vif.delay_channel_mask {
+      bins aw={10'h001}; bins w={10'h002}; bins b={10'h004};
+      bins ar={10'h008}; bins r={10'h010}; bins ac={10'h020};
+      bins cr={10'h040}; bins cd={10'h080}; bins rack={10'h100}; bins wack={10'h200};
+    }
+    cp_timeout: coverpoint {vif.err_snoop_timeout_b, vif.err_slave_timeout_b,
+                            vif.err_snoop_timeout_a, vif.err_main_timeout_a} {
+      bins none={4'b0000}; bins a_main={4'b0001}; bins a_snoop={4'b0010};
+      bins b_slave={4'b0100}; bins b_home={4'b1000};
+    }
+    mode_channel_cross: cross cp_mode, cp_mask;
+  endgroup
+
   function new(string name = "ace_coverage", uvm_component parent = null);
     super.new(name, parent);
     ord_imp  = new("ord_imp", this);
@@ -109,6 +129,7 @@ class ace_coverage extends uvm_subscriber #(ace_snoop_item);
     cg_snoop = new();
     cg_fsm   = new();
     cg_r     = new();
+    cg_link  = new();
     ord_last = new();
   endfunction
 
@@ -124,6 +145,7 @@ class ace_coverage extends uvm_subscriber #(ace_snoop_item);
       @(posedge vif.aclk);
       cg_fsm.sample();
       cg_r.sample();
+      cg_link.sample();
       // 命中位图同步记一笔 (报告里精确到 bin)
       seen_st_a[vif.st_a] = 1'b1;
       seen_sn_a[vif.sn_a] = 1'b1;
@@ -158,12 +180,13 @@ class ace_coverage extends uvm_subscriber #(ace_snoop_item);
        "[cg_snoop] type=%3.0f%% resp=%3.0f%% cross(type,resp)=%3.0f%%\n",
        "[cg_fsm  ] st_a=%3.0f%% sn_a=%3.0f%% st_b=%3.0f%% hs_b=%3.0f%%\n",
        "[cg_r    ] rtag=%3.0f%%\n",
+       "[cg_link ] mode=%3.0f%% channel=%3.0f%% timeout=%3.0f%% cross=%3.0f%%\n",
        "[bin 命中位图, 1=踩到 0=未踩到, 位序与标签一致]\n",
        "  st_a [M_IDLE M_W_AW M_W_W M_W_B M_R_AR M_R_R] = %b%b%b%b%b%b\n",
        "  sn_a [S_IDLE S_CR S_CD]                       = %b%b%b\n",
        "  st_b [B_IDLE B_W B_B B_R]                     = %b%b%b%b\n",
        "  hs_b [H_IDLE H_SEND_AC H_WAIT_CR H_WAIT_CD H_GAP] = %b%b%b%b%b\n",
-       "  dmode[prbs xcode seq walk1]                   = %b%b%b%b\n",
+       "  dmode[prbs31 xcode seq walk1 prbs23 prbs10]  = %b%b%b%b%b%b\n",
        "  aline[l0 l1 l2 l3]                            = %b%b%b%b"},
       vif.cfg_data_mode, n_ord,
       cg_ord.cp_write.get_coverage(), cg_ord.cp_arsn.get_coverage(),
@@ -174,12 +197,15 @@ class ace_coverage extends uvm_subscriber #(ace_snoop_item);
       cg_fsm.cp_st_a.get_coverage(), cg_fsm.cp_sn_a.get_coverage(),
       cg_fsm.cp_st_b.get_coverage(), cg_fsm.cp_hs_b.get_coverage(),
       cg_r.cp_rtag.get_coverage(),
+      cg_link.cp_mode.get_coverage(), cg_link.cp_mask.get_coverage(),
+      cg_link.cp_timeout.get_coverage(), cg_link.mode_channel_cross.get_coverage(),
       seen_st_a[0], seen_st_a[1], seen_st_a[2], seen_st_a[3],
       seen_st_a[4], seen_st_a[5],
       seen_sn_a[0], seen_sn_a[1], seen_sn_a[2],
       seen_st_b[0], seen_st_b[1], seen_st_b[2], seen_st_b[3],
       seen_hs_b[0], seen_hs_b[1], seen_hs_b[2], seen_hs_b[3], seen_hs_b[4],
       seen_dmode[0], seen_dmode[1], seen_dmode[2], seen_dmode[3],
+      seen_dmode[4], seen_dmode[5],
       seen_aline[0], seen_aline[1], seen_aline[2], seen_aline[3]),
       UVM_LOW)
   endfunction

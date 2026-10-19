@@ -13,8 +13,8 @@ ace-full-project/
 │
 ├── tb/  +  sim/              【环境一】直连 smoke（本地 iverilog / 服务器 VCS）
 │   ├── tb_direct.sv              A↔B 直连, 内部激励自跑, 轻量 SVA, X 检测器, 观测计数
-│   ├── run_local.sh              本地一键: 编译一次, 跑 4 码型矩阵, 逐模式判定
-│   ├── run_vcs.sh                服务器 VCS 版: bash sim/run_vcs.sh [码型]
+│   ├── run_local.sh              本地一键: 编译一次, 跑 6 码型矩阵, 逐模式判定
+│   ├── run_vcs.sh                服务器 VCS 版: bash sim/run_vcs.sh [码型] [Burst拍数]
 │   ├── filelist.f / Makefile
 │   └── decl_check.py             声明-使用顺序扫描器 (VCS IND 预防, 上服务器前跑)
 │
@@ -47,21 +47,23 @@ ace-full-project/
 ### 环境一：本地 iverilog（最快反馈，码型矩阵）
 
 ```bash
-bash sim/run_local.sh          # 编译一次, 自动跑 DATA_MODE=0..3 全矩阵
+bash sim/run_local.sh          # 编译一次, 自动跑 DATA_MODE=0..5 全矩阵
 bash sim/run_local.sh 2        # 只跑指定码型
+bash sim/run_local.sh 2 8      # 指定码型，并使用8拍Burst
 ```
-判据：`PASS 码型: 0 1 2 3` + `SMOKE PASS`。日志按码型分文件 `sim/run_local_mode<N>.log`。
+判据：`PASS 码型: 0 1 2 3 4 5` + `SMOKE PASS`。日志按码型分文件 `sim/run_local_mode<N>.log`。
 
 ### 环境二：服务器 VCS 直连 smoke（SVA 断言真实执行）
 
 ```bash
 bash sim/run_vcs.sh            # 默认码型 0
 bash sim/run_vcs.sh 2          # 指定码型
+bash sim/run_vcs.sh 2 8        # 指定码型，并使用8拍Burst
 ```
-判据：`SMOKE PASS (data_mode=N)`。日志 `sim/run_mode<N>.log`。
+判据：`SMOKE PASS (data_mode=N, burst_beats=B)`。日志 `sim/run_mode<N>_burst<B>.log`。
 上服务器前先本地跑 `python3 sim/decl_check.py .`（VCS 声明顺序预防检查）。
 
-### 环境三：服务器独立 UVM（三用例 × 四码型）
+### 环境三：服务器独立 UVM（三用例 × 六码型）
 
 ```bash
 bash uvm/sim/run_uvm_vcs.sh ace_smoke_test        # 默认码型 0
@@ -89,10 +91,12 @@ UVM_ERROR:0 + UVM_FATAL:0 四重 grep）。日志 `passive_vip_mode<N>.log`。
 
 | mode | 名称 | 生成式 f(行,拍) | 抓什么故障 |
 |---|---|---|---|
-| 0（默认）| PRBS | prbs128(hash(行,拍,cfg_prbs_code)) | 随机位错误（通用兜底）|
+| 0（默认）| PRBS31 | `x^31+x^28+1`，按地址/拍号生成种子 | 长周期随机位错误 |
 | 1 | 全同字节 | {16{cfg_xcode}} 铺满 128b | 信号线粘 0 / 粘 1 |
 | 2 | 行号+拍号序列号 | {4{行[15:0], 拍, 行[23:16]}} | 数据送错行、拍序错乱 |
 | 3 | 走 1 码 | one-hot 按 (行低位+拍) 循环左移 | 位滑动（线序/位序接线错）|
+| 4 | PRBS23 | `x^23+x^18+1`，按地址/拍号生成种子 | 中等周期PRBS兼容性 |
+| 5 | PRBS10 | `x^10+x^7+1`，按地址/拍号生成种子 | 短周期PRBS和快速重复模式 |
 
 **设置方式（三通道，优先级 plusarg > define > 默认 0）**：
 
@@ -106,19 +110,90 @@ UVM_ERROR:0 + UVM_FATAL:0 四重 grep）。日志 `passive_vip_mode<N>.log`。
 旧码型数据与 A 的新期望值失配 → 假报错。要换码型 = 重跑一次仿真（脚本的矩阵
 模式就是为此设计）。
 
+### Burst拍数配置
+
+Module A的APB `BURST_CFG(0x020)` 低8位保存AXI LEN，实际拍数为 `LEN+1`。
+测试脚本使用 `BURST_BEATS` 表示实际拍数，合法范围为 `2..256`，默认4拍：
+
+```bash
+bash sim/run_vcs.sh 0 8                       # Direct VCS：8拍
+simv +DATA_MODE=0 +BURST_BEATS=8             # 直接运行simv
+```
+
+Single Write/Read始终为1拍；Burst Write/Read使用配置的拍数。
+
 ---
 
 ## 4. UVM 用例介绍
 
-三个 test 共用同一测试基类，**区别只在启动哪条剧本（sequence）**：
+六个 test 共用同一测试基类，区别在于启动的 sequence、链路延迟模式和预期结果：
 
 | test（+UVM_TESTNAME）| 剧本 | 内容 | 定位 |
 |---|---|---|---|
 | `ace_smoke_test` | ace_write_read_seq | 每行三笔：写(WU)→读(RS)→独占读(RU)，4 行 12 笔 | 数据面地基回归（每次改 RTL 第一反应）；RU 确定性制造 UD 行 |
 | `ace_snoop_test` | ace_snoop_seq | 三轮读：RS 铺行 → RS 重读 → RU 重读 | 一致性闭环演练：第二轮触发 IsShared 共享闭环，第三轮触发脏行 CD 闭环 |
 | `ace_random_test` | ace_random_seq | 50 笔随机合法订单（读写≈3:7，属性/地址随机）| 随机交错压力 + 覆盖收敛（多轮多 seed）|
+| `ace_link_delay_test` | ace_write_read_seq | 由mask选择ACE通道，经单槽链路缓冲并固定延迟4拍 | 检查延迟后事务、snoop及CD闭环仍能完成 |
+| `ace_link_timeout_test` | ace_write_read_seq | mask目标通道延迟300拍，超过256拍超时阈值 | 负向测试：命中Module A/B预期timeout且无其他功能错误时判定PASS |
+| `ace_link_order_test` | ace_random_seq | 50笔随机订单，十通道同时延迟4拍 | 检查逐通道输入/输出数量、顺序及payload稳定性 |
 
-三个 test 都会伴随 home 自动出题质询；收尾等待 500 拍供 home 完成最后的质询
+单项运行：
+
+```bash
+bash uvm/sim/run_uvm_vcs.sh ace_smoke_test
+bash uvm/sim/run_uvm_vcs.sh ace_snoop_test
+bash uvm/sim/run_uvm_vcs.sh ace_random_test
+bash uvm/sim/run_uvm_vcs.sh ace_link_delay_test
+bash uvm/sim/run_uvm_vcs.sh ace_link_timeout_test
+bash uvm/sim/run_uvm_vcs.sh ace_link_order_test
+```
+
+第二个参数选择数据模式，取值为 `0..5`。例如运行六种 smoke 数据模式：
+
+```bash
+for mode in 0 1 2 3 4 5; do
+  bash uvm/sim/run_uvm_vcs.sh ace_smoke_test "$mode"
+done
+```
+
+链路逐通道矩阵：
+
+```bash
+bash uvm/sim/run_link_delay_matrix.sh
+bash uvm/sim/run_link_timeout_matrix.sh
+bash uvm/sim/run_uvm_vcs.sh ace_link_order_test
+```
+
+mask映射：`001/002/004/008/010/020/040/080/100/200`分别对应
+`AW/W/B/AR/R/AC/CR/CD/RACK/WACK`。
+
+第三个参数可以直接指定单个通道mask，例如：
+
+```bash
+bash uvm/sim/run_uvm_vcs.sh ace_link_delay_test 0 020
+bash uvm/sim/run_uvm_vcs.sh ace_link_timeout_test 0 040
+```
+
+本地非UVM基础回归及链路模块单元测试：
+
+```bash
+bash sim/run_local.sh
+
+mkdir -p sim/build
+iverilog -g2012 -D__ICARUS__ -s tb_link_delay \
+  -o sim/build/link_delay.vvp \
+  rtl/link/ace_ucie_link_model.sv sim/tb_link_delay.sv
+vvp sim/build/link_delay.vvp
+```
+
+结果判定：
+
+- 正常UVM测试：`UVM_ERROR : 0`、`UVM_FATAL : 0`并出现`TEST_PASS`；
+- timeout负向测试：观察到预期timeout、没有其他功能错误并出现`TEST_PASS`；
+- 本地基础回归：出现`TB_PASS`和`SMOKE PASS`；
+- 链路模块单元测试：出现`LINK_DELAY_TEST_PASS`。
+
+前三个功能test都会伴随 home 自动出题质询；收尾等待 500 拍供 home 完成最后的质询
 与 CD 收货。完整用例空间 = **3 test × 4 码型 = 12 格**。
 命令行上的名字（`+UVM_TESTNAME`）选的是 test；剧本由 test 的 run_phase 内部
 创建并启动——考试与试卷分离，可自由组合。
@@ -220,4 +295,3 @@ B home: 后续质询该行 → A 应答 CRRESP|IsShared(留副本) → 目录降
 [1]=期望应答取反——"该报错的必须报"）。
 
 ---
-
